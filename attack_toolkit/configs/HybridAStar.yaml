@@ -1,0 +1,57 @@
+# Vehicle parameters
+vehicle:
+  wheelbase: 3.0  # [m] rear to front wheel (WB)
+  width: 2.0  # [m] width of car (W)
+  front_length: 3.3  # [m] distance from rear to vehicle front end (LF)
+  back_length: 1.0  # [m] distance from rear to vehicle back end (LB)
+  max_steering_angle: 0.6  # [rad] maximum steering angle
+
+# Goal region parameters
+goal:
+  radius: 1.5  # meters
+  heading_range: 1.047  # radians (about 60 degrees)
+
+# Grid parameters
+grid:
+  x_range: [-15, 15]  # [m] x range
+  y_range: [0, 30]  # [m] y range
+  
+  xy_resolution: 1  # [m] grid resolution
+  yaw_resolution: 0.261799  # [rad] yaw angle resolution (15 degrees)
+  
+  motion_resolution: 0.2  # [m] path interpolate resolution (0.2 - 0.3m is a good balace between accuracy and runtime)
+  n_steer: 10  # number of steer commands
+  
+  # xy_resolution: 1  # [m] grid resolution
+  # yaw_resolution: 0.261799  # [rad] yaw angle resolution (15 degrees)
+  
+  # motion_resolution: 0.1  # [m] path interpolate resolution
+  # n_steer: 20  # number of steer commands
+
+# Cost weights
+# Conservative: Produces very smooth, cautious trajectories
+# Balanced: General-purpose settings for most scenarios
+# Aggressive: Allows more complex maneuvers when needed
+# | Parameter | Conservative | Balanced | Aggressive |
+# |-----------|--------------|----------|------------|
+# | switch_back | 150.0 | 100.0 | 50.0 |
+# | backward | 20.0 | 10.0 | 5.0 |
+# | steering_change | 15.0 | 10.0 | 5.0 |
+# | steering | 8.0 | 5.0 | 2.0 |
+# | heuristic | 5.0 | 7.0 | 10.0 |
+costs:
+  switch_back: 100.0  # switch back penalty cost
+  backward: 10.0  # backward penalty cost
+  steering_change: 10.0  # steer angle change penalty cost
+  steering: 5.0  # steer angle penalty cost
+  heuristic: 7.0  # heuristic cost
+
+  # switch_back: 100.0  # switch back penalty cost
+  # backward: 5.0  # backward penalty cost
+  # steering_change: 5.0  # steer angle change penalty cost
+  # steering: 1.0  # steer angle penalty cost
+  # heuristic: 5.0  # heuristic cost
+
+# Planning parameters
+planning:
+  timeout: 180  # [s] timeout for planning

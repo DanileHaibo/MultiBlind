@@ -1,0 +1,30 @@
+blind:
+  total_locs: 400
+  sample_interval: 0.5
+  locs_height_num: 4
+  
+  sample: True
+  samples_per_loc: 2
+  sample_range: 1.0  # Size of search grid in meters
+
+# attack.type=blind_dual: P1=单点 RSA(diverge)；P2 由 blind_dual.p2_line 决定，见
+#   utils_blind_attack_dual.build_p2_search_polyline_2d。min_anchor_sep_m 为历史保留。
+blind_dual:
+  min_anchor_sep_m: 3.0
+  min_pair_sep_m: 1.5
+  # P2: same_side_2nd_divider=与 P1 同侧第2条车道线GT | same_bend=对侧同弯 | full_ref | diverge_points
+  p2_line: same_side_2nd_divider
+
+patch:
+  total_locs: 400
+  sample_interval: 0.5
+  step_per_loc: 20  # pso
+  
+  sample: True
+  samples_per_loc: 2
+  sample_range: 1.0
+
+  type: 'vertical'
+  width: 3
+  height: 2
+  heading: 0

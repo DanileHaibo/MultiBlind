@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  mapattack:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    image: mapattack:latest
+    container_name: mapattack_artifact
+    
+    # Enable GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    # Mount volumes for data and outputs
+    volumes:
+      - ./data:/workspace/data:ro  # Read-only data mount
+      - ./outputs:/workspace/outputs:rw  # Read-write outputs
+      - ./configs:/workspace/mapattack/configs:ro  # Config files
+    
+    # Environment variables
+    environment:
+      - PYTHONPATH=/workspace/mapattack
+      - CUDA_VISIBLE_DEVICES=0
+    
+    # Interactive mode
+    stdin_open: true
+    tty: true
+    
+    # Command to run experiments
+    working_dir: /workspace/mapattack
