@@ -1,7 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-# Dual blind: P1 = RSA on diverge. P2 = on the *opposite-lane* curved line: the
-# reference polyline *segment* that is aligned to the same bend as diverge (not the
-# full reference straight extent).
+# Dual blind: P1 = RSA on diverge. P2 = 由 blind_dual.p2_line 决定，可为对侧 reference
+# 裁切段(same_bend)或同条 diverge 路沿(diverge_same_edge) 等，见
+# build_p2_search_polyline_2d / build_p2_diverge_same_edge。
+
 # Does not modify train_blind_attack.py behavior.
 import json
 import os
@@ -26,6 +27,7 @@ from attack_toolkit.src.utils.utils_attack import (
 )
 from attack_toolkit.src.utils.utils_blind_attack_dual import (
     apply_dual_lens_flare,
+    build_p2_diverge_same_edge,
     build_p2_on_reference_boundary,
     build_p2_search_polyline_2d,
 )
@@ -43,6 +45,14 @@ def _get_blind_dual_cfg(cfg):
         'min_anchor_sep_m': 3.0,
         'min_pair_sep_m': 1.5,
         'p2_line': 'same_side_2nd_divider',
+        # p2_line=gt_bboxes_index 时：P2 在 GT bboxes[下标] 上密采，下标来自
+        # p2_gt_token_map_path(JSON: token->int) ；缺 token 用 p2_gt_bboxes_index 整型回退(可省略)
+        'p2_gt_token_map_path': None,
+        'p2_gt_bboxes_index': None,
+        # p2_line=diverge_same_edge 时：仅保留 |κ_P2-κ_P1| ≤ 该值；0 或 None=不按阈值、仅按曲率差升序
+        'p2_curvature_match_max': 0.25,
+        'p2_target_far_t0': 0.65,  # 兼容项；target_far=脊柱全程对位到对侧 ref，不再用后段 t0
+        'p2_stitch_step': 5,  # target_far + asymmetric: 与 get_target 的拼接 step 一致
     }
     if hasattr(cfg.attack, 'blind_dual') and cfg.attack.blind_dual is not None:
         bd = cfg.attack.blind_dual
@@ -51,6 +61,55 @@ def _get_blind_dual_cfg(cfg):
             if k in u:
                 defaults[k] = u[k]
     return defaults
+
+
+_P2_TOKEN_MAP_RESOLVED: str | None = None
+_P2_TOKEN_MAP: dict = {}
+
+
+def _reset_p2_token_map_cache() -> None:
+    """Tests / 多 run 时如需清缓存可调用。单进程一图即可，路径变则重载。"""
+    global _P2_TOKEN_MAP_RESOLVED, _P2_TOKEN_MAP
+    _P2_TOKEN_MAP_RESOLVED = None
+    _P2_TOKEN_MAP = {}
+
+
+def _resolve_p2_token_map_path(map_path, cfg) -> str | None:
+    if not map_path:
+        return None
+    map_path = os.path.normpath(os.path.expanduser(str(map_path)))
+    if os.path.isfile(map_path):
+        return map_path if os.path.isabs(map_path) else os.path.abspath(map_path)
+    fn = getattr(cfg, 'filename', None) or getattr(cfg, '_filename', None)
+    if fn:
+        alt = os.path.join(os.path.dirname(str(fn)), map_path)
+        if os.path.isfile(alt):
+            return os.path.normpath(alt)
+    print(
+        f'[warn] p2_gt_token_map_path 非文件(已跳过): {map_path!r}',
+        flush=True,
+    )
+    return None
+
+
+def _get_p2_token_index_map(bd: dict, cfg) -> dict:
+    """token(str) -> int, 自 p2_gt_token_map_path 延迟加载、按路径缓存。"""
+    global _P2_TOKEN_MAP_RESOLVED, _P2_TOKEN_MAP
+    p = bd.get('p2_gt_token_map_path')
+    rp = _resolve_p2_token_map_path(p, cfg)
+    if not rp:
+        return {}
+    if _P2_TOKEN_MAP_RESOLVED == rp and _P2_TOKEN_MAP:
+        return _P2_TOKEN_MAP
+    with open(rp, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+    _P2_TOKEN_MAP = {str(k): int(v) for k, v in raw.items()}
+    _P2_TOKEN_MAP_RESOLVED = rp
+    print(
+        f'[blind_dual] 已加载 p2_gt_token_map: {len(_P2_TOKEN_MAP)} 项 ← {rp}',
+        flush=True,
+    )
+    return _P2_TOKEN_MAP
 
 
 def single_gpu_attack_camera_blind_dual(
@@ -233,6 +292,16 @@ def single_gpu_attack_camera_blind_dual(
 
         p2_mode_name = str(dual_cfg.get('p2_line', 'same_bend') or 'same_bend')
         p2_dps = scene_label.get('diverge_points')
+        p2_t0 = float(dual_cfg.get('p2_target_far_t0', 0.65) or 0.65)
+        sp_np = target_boundary_pts.detach().cpu().numpy()
+        loss_spine_2d = sp_np[:, :2] if sp_np.ndim == 2 and sp_np.shape[1] >= 2 else None
+        p2_stitch = int(dual_cfg.get('p2_stitch_step', 5) or 5)
+        p2_ex_idx = None
+        if str(p2_mode_name).strip().lower() == 'gt_bboxes_index':
+            tmap = _get_p2_token_index_map(dual_cfg, cfg)
+            p2_ex_idx = tmap.get(str(sample_token))
+            if p2_ex_idx is None and dual_cfg.get('p2_gt_bboxes_index') is not None:
+                p2_ex_idx = int(dual_cfg['p2_gt_bboxes_index'])
         p2_lane_line_2d, p2_line_note = build_p2_search_polyline_2d(
             p2_mode_name,
             diverge_boundary_pts,
@@ -244,6 +313,12 @@ def single_gpu_attack_camera_blind_dual(
             right_boundary_pts=right_boundary_pts,
             gt_fixed_num_sampled_points=gt_bboxes_3d.fixed_num_sampled_points,
             gt_labels_3d=gt_labels_3d,
+            loss_spine_xy=loss_spine_2d,
+            p2_target_far_t0=p2_t0,
+            attack_loss=str(getattr(cfg.attack, 'loss', 'rsa')),
+            attack_dataset=str(getattr(cfg.attack, 'dataset', 'asymmetric')),
+            p2_stitch_step=p2_stitch,
+            p2_explicit_gt_bboxes_index=p2_ex_idx,
         )
         print(
             f'[P2] 搜索线: {p2_line_note} (p2_line={p2_mode_name!r}, '
@@ -364,7 +439,7 @@ def single_gpu_attack_camera_blind_dual(
         if loc1 is None:
             loc1 = top_attack_locs[0] if len(top_attack_locs) > 0 else None
 
-        # ----- Phase 2: 固定 P1，在「对面」reference 车道线候选上搜 P2 -----
+        # ----- Phase 2: 固定 P1，在 P2 搜索线（p2_line）上选第二眩光 -----
         if cfg.attack.loss in ['rsa', 'eta']:
             best_loss = 1e10
         else:
@@ -372,12 +447,32 @@ def single_gpu_attack_camera_blind_dual(
         best_pair = (None, None)
 
         if loc1 is not None:
-            second_locs = build_p2_on_reference_boundary(
-                attack_loc_candidates_opposite,
-                loc1,
-                total_locs,
-                dual_cfg['min_pair_sep_m'],
-            )
+            p2_m = str(p2_mode_name or 'same_bend').strip().lower()
+            if p2_m == 'diverge_same_edge':
+                kraw = dual_cfg.get('p2_curvature_match_max', None)
+                kmax: float | None
+                if kraw is None:
+                    kmax = None
+                else:
+                    try:
+                        kmax = float(kraw)
+                    except (TypeError, ValueError):
+                        kmax = None
+                second_locs = build_p2_diverge_same_edge(
+                    attack_loc_candidates_opposite,
+                    loc1,
+                    total_locs,
+                    dual_cfg['min_pair_sep_m'],
+                    np.asarray(diverge_boundary_pts, dtype=np.float64)[:, :2],
+                    curvature_match_max=kmax,
+                )
+            else:
+                second_locs = build_p2_on_reference_boundary(
+                    attack_loc_candidates_opposite,
+                    loc1,
+                    total_locs,
+                    dual_cfg['min_pair_sep_m'],
+                )
             if len(second_locs) == 0:
                 sep = dual_cfg['min_pair_sep_m']
                 for p, _ in attack_loc_candidates_opposite:
@@ -395,9 +490,8 @@ def single_gpu_attack_camera_blind_dual(
                 best_loss = best_loss_phase1
                 best_pair = (loc1, None)
             print(
-                f'\n\n[Dual phase 2] Fixed loc1 (single-blind best), '
-                f'searching {len(second_locs)} second locations on opposite-curve ref segment '
-                f'(aligned w/ diverge)...\n'
+                f'\n\n[Dual phase 2] 固定 P1(单盲最优), 在 P2 搜索线 上试 {len(second_locs)} 个候选: '
+                f'{p2_line_note!r} (p2_line={p2_mode_name!r}) ...\n'
             )
 
             for j, attack_loc_2 in enumerate(second_locs):

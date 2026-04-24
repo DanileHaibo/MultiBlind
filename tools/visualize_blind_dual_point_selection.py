@@ -3,9 +3,15 @@
 Offline BEV 可视化：双点 blind 选取逻辑（与当前 train_blind_attack_dual 一致，不跑模型）。
 
 P1：沿场景标注的 diverge 侧（left/right + diverge_boundary_tag）密采+扰动，RSA 同单点。
-P2：见 --p2-line（同 blind_dual.p2_line）：默认可设为与 P1 同侧第 2 条 divider（same_side_2nd_divider）；
-   或 same_bend 对弯裁切、full_ref、 diverge_points。同侧模式需读 GT json（bboxes+labels）；
-   可用 --p2-gt-edge-id 强制某条 GT 边。洋红为 diverge_points(若有)。
+P2：见 --p2-line，**target_far_opposite**=loss 脊柱 与 对侧 reference
+   横截对位（成对之另一车道边）上密采，见 --p2-attack-loss。同侧第2条需 GT。
+   --p2-gt-edge-id 可强制 bboxes 某条边。洋红为 diverge_points(若有)。
+
+默认在 BEV 上叠画 **results/map/gt 中全部 bboxes**（与 draw_scene 一致），
+数字 = **bboxes 数组下标**（与 --p2-gt-edge-id 同索引）。`--no-gt-lane-overlay` 可关。
+
+**P2=固定 GT 边(与 Diverge 成对)**：`--p2-line gt_bboxes_index` + `--p2-gt-token-map`（各 token 对应下标 i），
+与训练里 `blind_dual.p2_line: gt_bboxes_index` + `p2_gt_token_map_path` 一致。
 """
 from __future__ import annotations
 
@@ -21,7 +27,10 @@ import yaml
 from matplotlib.patches import Circle
 from shapely.geometry import LineString, Point
 
-from attack_toolkit.src.utils.utils_blind_attack_dual import build_p2_search_polyline_2d
+from attack_toolkit.src.utils.utils_blind_attack_dual import (
+    build_p2_diverge_same_edge,
+    build_p2_search_polyline_2d,
+)
 
 
 def _build_opposite_curved_lane_polyline(
@@ -164,6 +173,140 @@ def _setup_mpl_cjk_font() -> None:
             return
 
 
+def _load_loss_spine_bev(
+    args,
+    diverge_pts: np.ndarray,
+    ref_pts: np.ndarray,
+    div_tag: str,
+) -> np.ndarray | None:
+    """与 train 中 RSA get_target / ETA 中心线一致的 2D loss 脊柱(用于 BEV 叠画)."""
+    al = str(getattr(args, 'p2_attack_loss', None) or 'rsa')
+    if al == 'eta':
+        rpc = args.root / 'dataset' / f'diverge_route_centerlines_{args.scenes}' / f'{args.token}.json'
+        if not rpc.is_file():
+            return None
+        with open(rpc) as f:
+            j = json.load(f)
+        arr = np.asarray(j, dtype=np.float64)
+        if arr.size < 4 or arr.shape[0] < 2:
+            return None
+        return arr[:, :2] if arr.shape[1] >= 2 else None
+    try:
+        from attack_toolkit.src.utils.utils_attack import get_target_boundary_pts
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    ds_ = str(getattr(args, 'p2_attack_dataset', None) or 'asymmetric')
+    try:
+        tb_ = get_target_boundary_pts(
+            np.asarray(diverge_pts, dtype=np.float64),
+            np.asarray(ref_pts, dtype=np.float64),
+            str(div_tag),
+            ds_,
+            step=5,
+        )
+    except (ImportError, ModuleNotFoundError):
+        return None
+    t = np.asarray(tb_, dtype=np.float64)
+    if t.size < 4 or t.shape[0] < 2:
+        return None
+    return t[:, :2] if t.shape[1] >= 2 else None
+
+
+def _resolve_map_gt_path(args) -> Path | None:
+    """与 --p2-gt-edge-id / same_side_2nd 相同：显式 --gt-json 或默认 train_.../gt/<token>.json 或 maptr 下任一路径。"""
+    gtp = getattr(args, 'gt_json', None)
+    if gtp is None:
+        gtp = (
+            args.root
+            / 'dataset/maptr-bevpool/train_blind_dual_rsa_asymmetric/results/map/gt'
+            / f'{args.token}.json'
+        )
+    gtp = Path(gtp)
+    if gtp.is_file():
+        return gtp
+    alts = list(
+        (args.root / 'dataset/maptr-bevpool').glob(f'*/results/map/gt/{args.token}.json')
+    )
+    if alts:
+        return sorted(alts, key=lambda p: str(p))[-1]
+    return None
+
+
+def _load_indexed_gt_bboxes(gtp: Path) -> list[tuple[int, np.ndarray]]:
+    """bboxes 列表中**原始下标 i** 与 polyline，仅跳过无效几何。"""
+    with open(gtp) as f:
+        gtj = json.load(f)
+    bbs = gtj.get('bboxes', [])
+    out: list[tuple[int, np.ndarray]] = []
+    for i, bb in enumerate(bbs):
+        a = np.asarray(bb, dtype=np.float64)
+        if a.ndim != 2 or a.shape[0] < 2 or a.shape[1] < 2:
+            continue
+        out.append((i, a[:, :2].copy()))
+    return out
+
+
+def _draw_indexed_gt_bboxes_on_ax(
+    ax,
+    indexed: list[tuple[int, np.ndarray]],
+    zorder: float = 0.3,
+) -> None:
+    if not indexed:
+        return
+    cmap = plt.get_cmap('tab20')
+    for orig_i, line_xy in indexed:
+        c = cmap((orig_i % 20) / 20.0)
+        ax.plot(
+            line_xy[:, 0],
+            line_xy[:, 1],
+            color=c,
+            ls='-',
+            lw=0.9,
+            alpha=0.7,
+            zorder=zorder,
+            solid_capstyle='round',
+        )
+        m = int(line_xy.shape[0] // 2)
+        tx, ty = float(line_xy[m, 0]), float(line_xy[m, 1])
+        ax.text(
+            tx,
+            ty,
+            str(orig_i),
+            fontsize=6,
+            fontweight='bold',
+            ha='center',
+            va='center',
+            zorder=zorder + 0.05,
+            color='0.1',
+            bbox={
+                'boxstyle': 'round,pad=0.12',
+                'facecolor': (1.0, 1.0, 1.0, 0.7),
+                'edgecolor': c,
+                'linewidth': 0.4,
+            },
+        )
+
+
+def _resolve_default_gt_json_path(args) -> Path | None:
+    gtp = args.gt_json
+    if gtp is None:
+        gtp = (
+            args.root
+            / 'dataset/maptr-bevpool/train_blind_dual_rsa_asymmetric/results/map/gt'
+            / f'{args.token}.json'
+        )
+    gtp = Path(gtp)
+    if gtp.is_file():
+        return gtp
+    alts = list(
+        (args.root / 'dataset/maptr-bevpool').glob(f'*/results/map/gt/{args.token}.json')
+    )
+    if alts:
+        return sorted(alts, key=lambda p: str(p))[-1]
+    return None
+
+
 def run_one(args) -> None:
     _setup_mpl_cjk_font()
     scene_path = args.root / 'dataset' / f'scenes_{args.scenes}' / f'{args.token}.json'
@@ -192,6 +335,9 @@ def run_one(args) -> None:
     locs_height = int(blind.get('locs_height_num', 4))
     total_locs = int(blind.get('total_locs', 400))
     min_pair = float(dual.get('min_pair_sep_m', 1.5))
+    p2t0 = float(dual.get('p2_target_far_t0', 0.65) or 0.65)
+    p2_stitch = int(dual.get('p2_stitch_step', 5) or 5)
+    loss_spine_bev = _load_loss_spine_bev(args, diverge_pts, ref_pts, div_tag)
 
     np.random.seed(0)
     # --- P1: diverge ---
@@ -212,29 +358,47 @@ def run_one(args) -> None:
             attack_cand_p1.append((p3, _pseudo_p1(xy)))
     attack_cand_p1.sort(key=lambda x: x[1], reverse=True)
 
-    # --- P2: 对边同弯子段 或 指定 GT 全图边 #i（与 draw_scene_edges_bev 的 # 一致）---
+    # --- P2: 对边同弯子段 或 指定 GT 全图边 #i（与图例数字 / --p2-gt-edge-id 同下标）---
+    bd0 = atk.get('blind_dual') or {}
+    p2_mode_arg = getattr(args, 'p2_line', None)
+    if p2_mode_arg is None and isinstance(bd0, dict) and 'p2_line' in bd0:
+        p2_mode_arg = str(bd0['p2_line'])
+    else:
+        p2_mode_arg = str(p2_mode_arg or 'same_bend')
+    p2m_low = p2_mode_arg.strip().lower()
+
+    p2_ei: int | None = None
+    p2_ei_from_map = False
+    if args.p2_gt_edge_id is not None:
+        p2_ei = int(args.p2_gt_edge_id)
+    elif p2m_low == 'gt_bboxes_index':
+        tm = getattr(args, 'p2_gt_token_map', None)
+        if tm and Path(tm).is_file():
+            with open(tm, encoding='utf-8') as f:
+                mp = json.load(f)
+            if args.token in mp:
+                p2_ei = int(mp[args.token])
+                p2_ei_from_map = True
+        if p2_ei is None and getattr(args, 'p2_gt_bboxes_index_fallback', None) is not None:
+            p2_ei = int(args.p2_gt_bboxes_index_fallback)
+        if p2_ei is None:
+            raise SystemExit(
+                'p2_line=gt_bboxes_index: 需在 --p2-gt-token-map 中给当前 token, '
+                '或设 --p2-gt-bboxes-fallback / --p2-gt-edge-id'
+            )
+
     ei_tar: int | None = None
     ei_eff: int | None = None
     p2_mode = '对边同弯 reference 子段'
-    if args.p2_gt_edge_id is not None:
-        gtp = args.gt_json
-        if gtp is None:
-            gtp = (
-                args.root
-                / 'dataset/maptr-bevpool/train_blind_dual_rsa_asymmetric/results/map/gt'
-                / f'{args.token}.json'
-            )
-        gtp = Path(gtp)
-        if not gtp.is_file():
-            alts = list(
-                (args.root / 'dataset/maptr-bevpool').glob(f'*/results/map/gt/{args.token}.json')
-            )
-            if alts:
-                gtp = sorted(alts, key=lambda p: str(p))[-1]
+    p2_line_key: str | None = None
+    if p2_ei is not None:
+        gtp = _resolve_default_gt_json_path(args)
+        if gtp is None or not gtp.is_file():
+            raise SystemExit('找不到 GT json（见 --gt-json 或 maptr.../gt/<token>.json）')
         with open(gtp) as f:
             gtj = json.load(f)
         bbs = gtj.get('bboxes', [])
-        ei_tar = int(args.p2_gt_edge_id)
+        ei_tar = int(p2_ei)
         nbb = len(bbs)
         if nbb < 1:
             raise SystemExit(f'无 bboxes: {gtp}')
@@ -242,7 +406,7 @@ def run_one(args) -> None:
         if not (0 <= ei_tar < nbb):
             if strict:
                 raise SystemExit(
-                    f'--p2-gt-edge-id={ei_tar} 越界: GT 共 {nbb} 条: {gtp}'
+                    f'P2 下标={ei_tar} 越界: GT 共 {nbb} 条: {gtp}'
                 )
             ei_eff = nbb - 1
         else:
@@ -251,35 +415,17 @@ def run_one(args) -> None:
         p2_mode = f'GT 全图边 #{ei_eff}' + (
             f' (n={nbb}条, 目標#{ei_tar} 不可用→末条)' if ei_eff != ei_tar else ''
         )
+        if p2_ei_from_map:
+            p2_mode += ' [token 映射表]'
         print('P2 GT 文件:', gtp.resolve(), f'| 下标 有效#{ei_eff} 目標#{ei_tar}')
+        p2_line_key = None
     else:
-        bd0 = atk.get('blind_dual') or {}
-        p2_mode_arg = getattr(args, 'p2_line', None)
-        if p2_mode_arg is None and isinstance(bd0, dict) and 'p2_line' in bd0:
-            p2_mode_arg = str(bd0['p2_line'])
-        else:
-            p2_mode_arg = str(p2_mode_arg or 'same_bend')
         gt_fixed = None
         gt_lbl = None
-        if p2_mode_arg.strip().lower() == 'same_side_2nd_divider':
-            gtp = args.gt_json
-            if gtp is None:
-                gtp = (
-                    args.root
-                    / 'dataset/maptr-bevpool/train_blind_dual_rsa_asymmetric/results/map/gt'
-                    / f'{args.token}.json'
-                )
-            gtp = Path(gtp)
-            if not gtp.is_file():
-                alts = list(
-                    (args.root / 'dataset/maptr-bevpool').glob(
-                        f'*/results/map/gt/{args.token}.json'
-                    )
-                )
-                if alts:
-                    gtp = sorted(alts, key=lambda p: str(p))[-1]
-            if gtp.is_file():
-                with open(gtp) as f:
+        if p2_mode_arg.strip().lower() in ('same_side_2nd_divider', 'same_side_curved_divider'):
+            gtp2 = _resolve_default_gt_json_path(args)
+            if gtp2 is not None and gtp2.is_file():
+                with open(gtp2) as f:
                     gtj = json.load(f)
                 bbs = gtj.get('bboxes', [])
                 labels = gtj.get('labels', [])
@@ -298,7 +444,13 @@ def run_one(args) -> None:
             right_boundary_pts=right_b,
             gt_fixed_num_sampled_points=gt_fixed,
             gt_labels_3d=gt_lbl,
+            loss_spine_xy=loss_spine_bev,
+            p2_target_far_t0=p2t0,
+            attack_loss=str(getattr(args, 'p2_attack_loss', None) or 'rsa'),
+            attack_dataset=str(getattr(args, 'p2_attack_dataset', None) or 'asymmetric'),
+            p2_stitch_step=p2_stitch,
         )
+        p2_line_key = str(p2_mode_arg or 'same_bend').strip().lower()
     p2_legend = f'P2: {p2_mode}'
     if ei_eff is not None:
         p2_legend = f'P2: GT 边 #{ei_eff}'
@@ -338,7 +490,25 @@ def run_one(args) -> None:
         else np.array(best_map[args.token][1], dtype=np.float64)
     )
 
-    second_locs = _build_p2_on_reference(attack_cand_p2, loc1, total_locs, min_pair)
+    kmax_vis = None
+    if isinstance(dual, dict) and dual.get('p2_curvature_match_max', None) is not None:
+        try:
+            kmax_vis = float(dual['p2_curvature_match_max'])
+        except (TypeError, ValueError):
+            kmax_vis = None
+
+    if p2_line_key == 'diverge_same_edge' and p2_ei is None:
+        div_xy = np.asarray(diverge_pts, dtype=np.float64)[:, :2]
+        second_locs = build_p2_diverge_same_edge(
+            attack_cand_p2,
+            loc1,
+            total_locs,
+            min_pair,
+            div_xy,
+            curvature_match_max=kmax_vis,
+        )
+    else:
+        second_locs = _build_p2_on_reference(attack_cand_p2, loc1, total_locs, min_pair)
     if len(second_locs) == 0:
         for p, _ in attack_cand_p2:
             if float(np.linalg.norm(p[:2] - loc1[:2])) >= min_pair:
@@ -352,6 +522,14 @@ def run_one(args) -> None:
     second_xy = (
         np.array([p[:2] for p in second_locs]) if len(second_locs) else np.zeros((0, 2))
     )
+    # GT 全图 bboxes（下标=编号），与 --p2-gt-edge-id 同索引
+    gt_indexed: list[tuple[int, np.ndarray]] = []
+    if not getattr(args, 'no_gt_lane_overlay', False):
+        _gp = _resolve_map_gt_path(args)
+        if _gp is not None and _gp.is_file():
+            gt_indexed = _load_indexed_gt_bboxes(_gp)
+            print(f'GT 全图 bboxes: {len(gt_indexed)} 条 → {_gp.resolve()}')
+
     p2_line_for_dist = LineString(p2_lane_2d)
     d_p2_ref = None
     if loc2 is not None:
@@ -369,6 +547,13 @@ def run_one(args) -> None:
     all_xy = np.vstack([diverge_pts, ref_pts])
     if div_branch is not None:
         all_xy = np.vstack([all_xy, div_branch])
+    if loss_spine_bev is not None and len(loss_spine_bev) > 0:
+        all_xy = np.vstack([all_xy, loss_spine_bev])
+    if p2_lane_2d is not None and len(p2_lane_2d) > 0:
+        all_xy = np.vstack([all_xy, np.asarray(p2_lane_2d, dtype=np.float64)[:, :2]])
+    for _i, gxy in gt_indexed:
+        if len(gxy) >= 1:
+            all_xy = np.vstack([all_xy, gxy])
     cx, cy = float(np.median(all_xy[:, 0])), float(np.median(all_xy[:, 1]))
     xlim = (cx - span / 2, cx + span / 2)
     ylim = (cy - span / 2, cy + span / 2)
@@ -380,6 +565,9 @@ def run_one(args) -> None:
         ax.set_xlabel('x (m)')
         ax.set_ylabel('y (m)')
 
+    for ax in axes.ravel():
+        _draw_indexed_gt_bboxes_on_ax(ax, gt_indexed, zorder=0.3)
+
     def _plot_div_j(ax, with_label: bool) -> None:
         if div_branch is None or len(div_branch) < 2:
             return
@@ -388,11 +576,26 @@ def run_one(args) -> None:
             zorder=2, label='diverge_points(分/合流,非路沿)' if with_label else '_',
         )
 
+    def _draw_loss_spine(ax, label_full: bool) -> None:
+        if loss_spine_bev is None or len(loss_spine_bev) < 2:
+            return
+        ax.plot(
+            loss_spine_bev[:, 0],
+            loss_spine_bev[:, 1],
+            color='#c45c00',
+            ls='-',
+            lw=1.65,
+            alpha=0.9,
+            zorder=4.0,
+            label='loss 脊柱(与单盲/训练一致)' if label_full else '_',
+        )
+
     ax = axes[0, 0]
     ax.plot(ref_pts[:, 0], ref_pts[:, 1], 'k--', alpha=0.5, label='Reference（对面道）')
     ax.plot(diverge_pts[:, 0], diverge_pts[:, 1], 'b-', lw=2, label='Diverge（P1 候选折线）')
     _plot_div_j(ax, True)
-    ax.scatter(all_2d_div[:, 0], all_2d_div[:, 1], s=2, c='0.45', alpha=0.35, label='P1 2D 候选(密采+扰动)')
+    _draw_loss_spine(ax, label_full=True)
+    ax.scatter(all_2d_div[:, 0], all_2d_div[:, 1], s=2, c='0.45', alpha=0.35, label='P1 2D 候选(密采+扰动)', zorder=1)
     ax.set_title('(1) 阶段一：只沿 diverge 生成 P1 候选，RSA 同单点 blind')
     ax.legend(loc='upper right', fontsize=7)
 
@@ -400,6 +603,7 @@ def run_one(args) -> None:
     ax.plot(diverge_pts[:, 0], diverge_pts[:, 1], 'b-', alpha=0.3, linewidth=1, label='Diverge（P1）')
     ax.plot(ref_pts[:, 0], ref_pts[:, 1], 'k:', alpha=0.35, lw=1, label='整条 reference(示意)')
     _plot_div_j(ax, False)
+    _draw_loss_spine(ax, label_full=True)
     ax.plot(
         p2_lane_2d[:, 0], p2_lane_2d[:, 1], 'g-', lw=2.4, label=p2_legend,
     )
@@ -414,6 +618,7 @@ def run_one(args) -> None:
     ax = axes[1, 0]
     ax.plot(diverge_pts[:, 0], diverge_pts[:, 1], 'b-', lw=1.0, alpha=0.4, label='Diverge')
     _plot_div_j(ax, False)
+    _draw_loss_spine(ax, label_full=False)
     ax.plot(p2_lane_2d[:, 0], p2_lane_2d[:, 1], 'g-', lw=1.5, alpha=0.8, label='P2 密采线')
     if len(second_xy):
         ax.scatter(
@@ -453,6 +658,7 @@ def run_one(args) -> None:
     ax.plot(diverge_pts[:, 0], diverge_pts[:, 1], 'b-', lw=2, label='Diverge')
     ax.plot(ref_pts[:, 0], ref_pts[:, 1], 'k:', alpha=0.3, label='全 reference(灰)')
     _plot_div_j(ax, False)
+    _draw_loss_spine(ax, label_full=False)
     ax.plot(p2_lane_2d[:, 0], p2_lane_2d[:, 1], 'g-', lw=2, label='P2 密采线')
     ax.scatter([loc1[0]], [loc1[1]], c='#e6007a', s=300, marker='*', zorder=12, edgecolor='w', label='P1')
     if loc2 is not None:
@@ -473,8 +679,13 @@ def run_one(args) -> None:
         out = args.root / f'dual_point_selection_viz_{args.token}.png'
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    _gt_leg = f'  |  彩线+数字=GT 全 bboxes(下标 i)'
+    if not gt_indexed:
+        _gt_leg = ''
     fig.suptitle(
-        f'双点 blind: P1=diverge；P2={p2_mode}', fontsize=12, fontweight='bold'
+        f'双点 blind: P1=diverge；P2={p2_mode}  |  土橙=loss 脊柱  绿=P2(多 asym 时=拼接第二边){_gt_leg}',
+        fontsize=12,
+        fontweight='bold',
     )
     fig.savefig(out, dpi=200)
     print(f'已保存: {out.resolve()}')
@@ -507,20 +718,59 @@ def _build_parser() -> argparse.ArgumentParser:
         '--p2-line',
         type=str,
         default=None,
-        choices=['same_bend', 'full_ref', 'diverge_points', 'same_side_2nd_divider'],
-        help='P2 密采折线；缺省读 attack_cfg 的 blind_dual.p2_line；同侧第2线需 GT json；--p2-gt-edge-id 优先后者',
+        choices=[
+            'same_bend',
+            'full_ref',
+            'diverge_points',
+            'same_side_2nd_divider',
+            'same_side_curved_divider',
+            'diverge_same_edge',
+            'target_far_opposite',
+            'gt_bboxes_index',
+        ],
+        help='P2 密采折线；same_side_curved_divider=同侧且优先曲率大。gt_bboxes_index=P2 在 bboxes[下标] 上',
+    )
+    ap.add_argument(
+        '--p2-attack-loss',
+        type=str,
+        default='rsa',
+        choices=['rsa', 'eta'],
+        help='p2_line=target_far 时: rsa=get_target 拼接(与单盲一致)；eta=diverge_route_centerlines json',
+    )
+    ap.add_argument(
+        '--p2-attack-dataset',
+        type=str,
+        default='asymmetric',
+        help='--p2-attack-loss=rsa 时 get_target_boundary 的 dataset 名',
     )
     ap.add_argument(
         '--p2-gt-edge-id',
         type=int,
         default=None,
-        help='[调试] P2 改在 GT 全图 bboxes[下标] 上密采。若指定则忽略 --p2-line',
+        help='P2 在 GT 全图 bboxes[该下标] 上密采(与图例数字同索引)。指定时优先, 不读 p2-gt-token-map',
+    )
+    ap.add_argument(
+        '--p2-gt-token-map',
+        type=Path,
+        default=None,
+        help='JSON: { "token": 下标int }；配合 --p2-line gt_bboxes_index，P1 仍在 diverge',
+    )
+    ap.add_argument(
+        '--p2-gt-bboxes-fallback',
+        type=int,
+        default=None,
+        help='p2-gt-token-map 无本 token 时的 bboxes 下标(可省略, 无则退出)',
     )
     ap.add_argument(
         '--gt-json',
         type=Path,
         default=None,
         help='显式 GT json；缺省为 train_blind_dual_rsa.../results/map/gt/<token>.json',
+    )
+    ap.add_argument(
+        '--no-gt-lane-overlay',
+        action='store_true',
+        help='不叠画 GT 全图 bboxes 及编号(默认: 与 draw_scene 一致, 数字=bboxes 下标)',
     )
     ap.add_argument(
         '--p2-strict',

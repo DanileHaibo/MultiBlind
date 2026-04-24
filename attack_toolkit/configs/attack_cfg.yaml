@@ -12,8 +12,21 @@ blind:
 blind_dual:
   min_anchor_sep_m: 3.0
   min_pair_sep_m: 1.5
-  # P2: same_side_2nd_divider=与 P1 同侧第2条车道线GT | same_bend=对侧同弯 | full_ref | diverge_points
+  # P2: same_side_2nd_divider=同侧第2条GT divider | same_side_curved_divider=同侧里优先曲率大
+  #     same_bend=对侧同弯裁切 | full_ref | diverge_points
+  #     diverge_same_edge=与 P1 同条 diverge 路沿，并优先与 P1 处曲率接近(见 p2_curvature_match_max)
+  #     target_far_opposite=loss 脊柱 与 对侧 reference(另一车道/路沿) 横截对位 上密采
+  #     gt_bboxes_index=P1 在 diverge；P2 在 fixed_num/bboxes[下标] 上(下标=按样本 token 查 p2_gt_token_map_path
+  #       的 JSON；无条目可用 p2_gt_bboxes_index 作默认) — 与 BEV 图例数字 一致
   p2_line: same_side_2nd_divider
+  # 例: 项目内 JSON {"<token1>": 8, "<token2>": 6}
+  # p2_gt_token_map_path: null
+  # p2_gt_bboxes_index: null
+  # diverge_same_edge 时：仅保留 |κ_P2-κ_P1| ≤ 该值；0 或省略则仅按曲率差排序(不设上界)
+  p2_curvature_match_max: 0.25
+  # target_far: asymmetric 时 P2 在 get_target 拼接的「第二边」; p2_target_far_t0 未用(兼容)
+  p2_target_far_t0: 0.65
+  p2_stitch_step: 5  # 与单盲 get_target_boundary step 一致
 
 patch:
   total_locs: 400
