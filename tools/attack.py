@@ -28,6 +28,9 @@ from mmdetection3d.mmdet3d.apis import single_gpu_attack_camera_blind
 from mmdetection3d.mmdet3d.apis.train_blind_attack_dual import (
     single_gpu_attack_camera_blind_dual,
 )
+from mmdetection3d.mmdet3d.apis.train_blind_attack_dual_eta import (
+    single_gpu_attack_camera_blind_dual_eta,
+)
 
 # # debug settings
 # import debugpy
@@ -324,8 +327,12 @@ def main():
             if getattr(cfg.attack, 'tag', None):
                 args.show_dir = args.show_dir + f'_{cfg.attack.tag}'
 
-            outputs, orig_outputs = single_gpu_attack_camera_blind_dual(
-                model, data_loader, cfg, args.show, args.show_dir)
+            if cfg.attack.loss == 'eta':
+                outputs, orig_outputs = single_gpu_attack_camera_blind_dual_eta(
+                    model, data_loader, cfg, args.show, args.show_dir)
+            else:
+                outputs, orig_outputs = single_gpu_attack_camera_blind_dual(
+                    model, data_loader, cfg, args.show, args.show_dir)
 
         else:
             

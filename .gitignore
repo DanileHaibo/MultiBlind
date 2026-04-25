@@ -4,7 +4,12 @@ dataset_processing/api.txt
 dataset/
 
 /*.sh
+!run_eta_blind_dual.sh
+!run_rsa_blind_dual.sh
 change_submit.py
+
+# 批量 BEV/选点可视化 PNG（可用 tools 脚本本地重生成）
+vis_*_100/
 cluster_submit.yaml
 
 # Byte-compiled / optimized / DLL files
